@@ -1,45 +1,49 @@
 # TriGuard-ETD
 
-TriGuard-ETD is a compact, multi-view detector for encrypted malicious traffic. It fuses three representations of a network flow — a byte-level ET-flow image, a packet timing/length sequence, and direct flow-statistical features — through depthwise convolutional, temporal, and MLP branches, combined with a masked adaptive gate. The student model is trained with a composite objective (cross-entropy, class-balanced focal loss, supervised contrastive learning, knowledge distillation from a validation-weighted teacher ensemble, and cross-view alignment).
+TriGuard-ETD is a compact multi-view detector for encrypted malicious traffic. It encodes three views of a network flow (a 40x40 byte image, a 5x5 packet-timing sequence, and a flow-statistics vector) with lightweight depthwise-convolutional, temporal, and gated-MLP branches, and fuses them with an availability-masked adaptive gate that gives zero weight to views a sample does not have. Training combines class-weighted cross-entropy, a class-balanced focal loss, supervised contrastive learning, cross-view alignment, per-view auxiliary supervision, and knowledge distillation from a teacher ensemble of temperature-calibrated specialists (LightGBM, XGBoost, ExtraTrees, RandomForest, and a logistic regression on timing). The ensemble weighting and the stopping epoch are chosen on validation macro-F1 only.
 
-This repository contains the full implementation used to produce the accompanying paper's results. It does not include raw datasets, precomputed caches, trained checkpoints, or the paper's result tables and figures — only the source code needed to regenerate them.
+The whole model (fitting, calibration, and scoring) is in one file, `triguard_etd.py`.
 
-## Design principles this codebase enforces
+## Installation
 
-The pipeline is built around a leakage-safe evaluation protocol rather than a conventional random train/test split, because encrypted-traffic datasets are unusually easy to leak across a split boundary (duplicated flows, shared source captures, or scalers fitted before splitting). Concretely:
+Python 3.10 or later. Install the dependencies directly:
 
-Every dataset is assigned a provenance group before any preprocessing happens — for packet-capture data this is the source capture file plus a canonical five-tuple, and for CSV-only data it is a Flow ID and timestamp composite, since Flow ID alone was found to co-occur with conflicting labels in at least one of the target datasets. Splitting happens at the group level, so no single flow's packets or duplicate feature vectors can appear in more than one partition. Median imputation and feature scaling are fit exclusively on the training partition and then applied to validation and test rows. Self-supervised pretraining, where used, reads only the training partition. Early stopping, teacher-ensemble weighting, and any hyperparameter search use validation performance only; the test partition is loaded once, after every modeling choice has already been locked in.
+    pip install torch numpy scipy scikit-learn lightgbm xgboost
 
-A class whose flows fall inside too few provenance groups to support a three-way split is not silently dropped and does not crash the pipeline — its groups are routed entirely into the training partition, it is recorded explicitly as train-only in the split manifest, and it correctly receives zero held-out support in the reported metrics rather than being hidden from them.
+Then copy `triguard_etd.py` next to your code, or clone this repository.
 
-## Requirements
+## Usage
 
-Python 3.10 or later and the packages listed in `requirements.txt`, which cover PyTorch, scikit-learn, LightGBM, XGBoost, pandas, and scapy. PCAP parsing depends on scapy and, on some platforms, a working libpcap installation; consult scapy's own installation notes if capture reading fails. A CUDA-capable GPU is strongly recommended for anything beyond the smallest datasets, though every training script also runs on CPU.
+Each partition is a dictionary with `image` (N,40,40 uint8), `timing` (N,5,5), `statistics` (N,d), and optionally `view_mask` (N,3 bool, ordered byte, timing, statistics). Statistics must be imputed and scaled with parameters fitted on the training partition only, and the splits should be group-disjoint.
 
-Install dependencies with pip against the provided requirements file from the repository root.
+    from triguard_etd import TriGuardETD
 
-## Data
+    model = TriGuardETD(profile="kd_balanced", seed=1, epochs=100, patience=12)
+    model.fit(train_views, y_train, val_views, y_val)
 
-No raw datasets are distributed with this repository. The paper uses USTC-TFC2016, 5GAD-2022, and TII-SSRC-23, each of which must be obtained separately from its original source and placed on disk before running any preprocessing script. USTC-TFC2016 and 5GAD-2022 are supplied as packet captures; TII-SSRC-23 is supplied as a flow-statistics CSV with an accompanying packet-capture corpus that this codebase intentionally does not claim to have verified a row-level join against, so TII is treated as a statistics-and-timing-proxy dataset rather than a genuine tri-view one unless that join is independently established.
+    probabilities = model.predict_proba(test_views)
+    predictions = model.predict(test_views)
+    report = model.score(test_views, y_test)   # accuracy, macro/weighted F1, ECE, Brier, NLL
 
-## Reproducing the pipeline
+Two loss/optimizer profiles are provided: `kd_balanced` (used for USTC-TFC2016 and TII-SSRC-23) and `focal_weighted` (used for 5GAD-2022 with `n_thresholds=0`). A custom profile can be passed as a dictionary with the same keys. `predict_proba(views, return_gates=True)` also returns the per-sample view weights.
 
-The general workflow is: extract provenance-preserving multi-view caches from raw captures or CSVs, optionally build a class-preserving stratified subsample of a cache if the full dataset is too large to train on repeatedly, run the multi-seed sweep and TriGuard-ETD under an identical frozen manifest for each seed, and aggregate the resulting per-seed result files into summary statistics with paired significance tests.
+## Result
 
-Preprocessing entry points live in `triguard/preprocess_pcap.py` (USTC-TFC2016 and 5GAD-2022) and `triguard/preprocess_tii.py` (TII-SSRC-23); each is a standalone script invoked with `python -m` and a `--root` or `--csv` path to the raw data, plus an output directory for the resulting cache. Both refuse to proceed if a supplied 5GAD capture turns out to be an unresolved Git LFS pointer rather than real packet data, since silently parsing a pointer file as a capture would otherwise produce a misleadingly successful but empty run.
-
-`scripts/subsample_cache.py` (and the equivalent `triguard/sample_cache.py`) draw a class-preserving sample from an already-preprocessed cache by capping the number of rows per class within each existing train/validation/test partition, rather than sampling proportionally, so that a dataset's rarest classes are retained rather than erased by a size reduction.
-
-`scripts/run_stage1_sweep.py` is the main experiment driver: given a cache, a list of seeds, and an epoch budget, it trains the TriGuard-ETD once per seed on the identical frozen manifest, skips any seed whose result file already exists so an interrupted run can be resumed without repeating finished work, and aggregates the completed seeds into a summary report once enough of them are done. Training uses validation-macro-F1-based early stopping rather than always running a fixed epoch budget, which is a registered variation of the reference protocol adopted because the fixed-epoch schedule is not computationally tractable across every dataset and seed count.
-
-`triguard/statistics.py` implements the aggregation step on its own if you need to re-run it independently of the sweep driver: it computes per-metric means, standard deviations, 95% confidence intervals, paired t-tests, Wilcoxon signed-rank tests, and Holm-corrected significance across a directory of matched-seed result files, and refuses to mix result files that used different manifests or different run statuses.
-
-The remaining scripts in `scripts/` are independent diagnostics rather than part of the core training loop: `run_ablations.py` runs the view- and loss-term ablation grid, `run_robustness.py` applies inference-time perturbations to an already-trained model's held-out data, `run_baselines.py` trains standalone conventional classifiers on the same frozen features TriGuard-ETD uses, and `run_transfer.py` runs a binary cross-dataset transfer diagnostic between two datasets' byte and timing branches.
-
-## Notes on what this code does not claim
-
-This is research code for a paper that documents its own limitations in detail; the code itself reflects that stance rather than smoothing it over. Model checkpoints are not persisted by the main sweep driver, so metrics computed inline during a run (including calibration statistics) are not retroactively recoverable without re-running that seed. Ablation and robustness scripts default to small seed counts because they are diagnostic in nature, and their result files are tagged with a status string that distinguishes them from the main multi-seed statistical comparisons. Readers looking for the paper's actual measured results, tables, and figures should consult the paper itself rather than this repository, which intentionally contains only the code that produced them.
+On 5GAD-2022, TriGuard-ETD reaches a macro-F1 of 0.815 under strict five-tuple grouping and 0.993 under temporal-session grouping, with all comparisons made on frozen, leakage-controlled partitions and matched seeds. On USTC-TFC2016 and TII-SSRC-23 it stays competitive with strong tabular learners, which obtain higher point estimates in feature-dominant settings.
 
 ## Citation
 
-If you use this code, please cite the accompanying paper. A citation entry will be added here once the paper has a final, stable reference.
+    @misc{massaoudi2026triguardetd,
+      title  = {TriGuard-ETD: A Leakage-Controlled Multi-View Learning Framework for Malicious Encrypted-Traffic Detection},
+      author = {Massaoudi, Mohamed and Ez Eddin, Maymouna and Refaat, Shady S. and Davis, Katherine R.},
+      year   = {2026},
+      note   = {Code: https://github.com/Mmassaoudi-cell/TriGuard-ETD}
+    }
+
+## License
+
+MIT. See the `LICENSE` file.
+
+## Contact
+
+Mohamed Massaoudi, mmassaoudi@tarleton.edu
